@@ -23,19 +23,4 @@ Projekat je kreiran kao rešenje zadatka za kolokvijum iz predmeta PSUSU (Projek
 - `Logger.cs` / `JobStats.cs` - Klase namenjene za praćenje statistike i beleženje događaja.
 - `Program.cs` - Ulazna tačka aplikacije gde se instancira sistem i simulira ubacivanje zadataka.
 
-## Zahtevi (Prerequisites)
 
-- **.NET SDK** (kompatibilan sa verzijom koja je navedena u `IndustrialProcessing.csproj`)
-- **Visual Studio** ili bilo koji drugi C# IDE (npr. VS Code, Rider)
-
-## Kako pokrenuti
-
-1. Klonirajte repozitorijum (ili preuzmite folder sa kodom).
-2. Otvorite `ProcessingSystem.sln` u Visual Studio-u.
-3. Prevedite projekat (Build Solution) kako biste obezbedili da se sve zavisnosti uspešno obnove.
-4. Pokrenite aplikaciju (Start).
-
-*Alternativno, iz komandne linije (CLI):*
-```bash
-dotnet build
-dotnet run --project IndustrialProcessing.csproj
