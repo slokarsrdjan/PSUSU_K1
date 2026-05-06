@@ -11,9 +11,15 @@ namespace IndustrialProcessing
     {
         private readonly int _maxQueueSize;
         private readonly List<Job> _jobQueue = new List<Job>();
-        private readonly HashSet<Guid> _processedJobs = new HashSet<Guid>(); // Idempotentnost
+        private readonly HashSet<Guid> _processedJobs = new HashSet<Guid>();
         private readonly object _lockObj = new object();
         private readonly List<JobStats> _stats = new List<JobStats>();
+
+        //Recnik koji cuva Task-ove kako bismo izbegli vezivanje TCS-a za Evente (resava race condition)
+        private readonly Dictionary<Guid, TaskCompletionSource<int>> _activeTasks = new Dictionary<Guid, TaskCompletionSource<int>>();
+
+        //Tajmer mora biti referenciran na nivou klase da ga Garbage Collector ne bi ubio!
+        private readonly Timer _reportTimer;
 
         public event Action<Guid, int> JobCompleted;
         public event Action<Guid, string> JobFailed;
@@ -28,12 +34,15 @@ namespace IndustrialProcessing
                 worker.Start();
             }
 
-
-            Timer reportTimer = new Timer(GenerateReport, null, TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(60));
+            //Inicijalizacija tajmera koji ce ziveti dok god zivi i ProcessingSystem objekat
+            _reportTimer = new Timer(GenerateReport, null, TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(60));
         }
 
         public JobHandle Submit(Job job)
         {
+            //Obezbedjujemo da se "await" u testu nastavi asinhrono i ne blokira glavnu nit
+            var tcs = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+
             lock (_lockObj)
             {
                 if (_jobQueue.Count >= _maxQueueSize)
@@ -48,29 +57,12 @@ namespace IndustrialProcessing
 
                 _processedJobs.Add(job.Id);
                 _jobQueue.Add(job);
+                _activeTasks[job.Id] = tcs; //Vezujemo Task direktno za posao
 
-                // Sortiramo po prioritetu (manji broj = veći prioritet)
+                //Sortiramo po prioritetu (manji broj = veci prioritet)
                 _jobQueue.Sort((x, y) => x.Priority.CompareTo(y.Priority));
 
                 Monitor.PulseAll(_lockObj);
-            }
-
-
-            var tcs = new TaskCompletionSource<int>();
-
-            Action<Guid, int> onCompleted = null;
-            Action<Guid, string> onFailed = null;
-
-            onCompleted = (id, res) => { if (id == job.Id) { tcs.TrySetResult(res); Cleanup(); } };
-            onFailed = (id, err) => { if (id == job.Id) { tcs.TrySetException(new Exception(err)); Cleanup(); } };
-
-            JobCompleted += onCompleted;
-            JobFailed += onFailed;
-
-            void Cleanup()
-            {
-                JobCompleted -= onCompleted;
-                JobFailed -= onFailed;
             }
 
             return new JobHandle { Id = job.Id, Result = tcs.Task };
@@ -86,14 +78,13 @@ namespace IndustrialProcessing
                 {
                     while (_jobQueue.Count == 0)
                     {
-                        Monitor.Wait(_lockObj); // Ceka dok se ne doda novi posao
+                        Monitor.Wait(_lockObj); //Ceka dok se ne doda novi posao
                     }
 
                     currentJob = _jobQueue[0];
                     _jobQueue.RemoveAt(0);
                     Monitor.PulseAll(_lockObj);
                 }
-
 
                 _ = ProcessJobWithRetryAsync(currentJob);
             }
@@ -111,17 +102,17 @@ namespace IndustrialProcessing
                 attempts++;
                 try
                 {
-                    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2)); // 2 sekunde timeout
+                    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2)); //2 sekunde timeout
                     finalResult = await ExecuteJobLogicAsync(job, cts.Token);
                     success = true;
                 }
                 catch (OperationCanceledException)
                 {
-                    // Timeout
+                    //Timeout
                 }
                 catch (Exception)
                 {
-                    // Neka druga greška
+                    //Neka druga greška
                 }
             }
 
@@ -134,13 +125,35 @@ namespace IndustrialProcessing
 
             if (success)
             {
+                //1. PRVO okinemo event i logujemo upis!
                 JobCompleted?.Invoke(job.Id, finalResult);
                 await Logger.LogAsync("COMPLETED", job.Id, finalResult.ToString());
+
+                //2. TEK ONDA oslobađamo Task da bi se test (ili onaj ko ceka) probudio
+                lock (_lockObj)
+                {
+                    if (_activeTasks.TryGetValue(job.Id, out var tcs))
+                    {
+                        tcs.TrySetResult(finalResult);
+                        _activeTasks.Remove(job.Id);
+                    }
+                }
             }
             else
             {
+                //1. PRVO okinemo event i logujemo!
                 JobFailed?.Invoke(job.Id, "ABORT");
                 await Logger.LogAsync("ABORT", job.Id, "Job Failed after 3 attempts");
+
+                //2. TEK ONDA padamo Task
+                lock (_lockObj)
+                {
+                    if (_activeTasks.TryGetValue(job.Id, out var tcs))
+                    {
+                        tcs.TrySetException(new Exception("ABORT"));
+                        _activeTasks.Remove(job.Id);
+                    }
+                }
             }
         }
 
@@ -153,9 +166,9 @@ namespace IndustrialProcessing
                 if (job.Type == JobType.Prime)
                 {
                     var parts = job.Payload.Split(',');
-                    int maxNumber = int.Parse(parts[0].Split(':')[1]);
+                    int maxNumber = int.Parse(parts[0].Split(':')[1].Replace("_", ""));
                     int threads = int.Parse(parts[1].Split(':')[1]);
-                    threads = Math.Clamp(threads, 1, 8); // Ograničenje [1, 8]
+                    threads = Math.Clamp(threads, 1, 8); // Ogranicenje [1, 8]
 
                     int primeCount = 0;
                     object countLock = new object();
@@ -172,11 +185,12 @@ namespace IndustrialProcessing
                 }
                 else if (job.Type == JobType.IO)
                 {
-                    int delay = int.Parse(job.Payload.Split(':')[1]);
-                    Thread.Sleep(delay); // Simulacija blokirajućeg I/O
+                    //Parsiranje delay-a sa obezbedjenim Replace-om!
+                    int delay = int.Parse(job.Payload.Split(':')[1].Replace("_", ""));
+                    Thread.Sleep(delay); //Simulacija blokirajućeg I/O
                     token.ThrowIfCancellationRequested();
 
-                    return new Random().Next(0, 101); // Random broj 0-100
+                    return new Random().Next(0, 101); //Random broj 0-100
                 }
 
                 throw new NotSupportedException("Nepoznat tip posla.");
@@ -191,7 +205,7 @@ namespace IndustrialProcessing
             return true;
         }
 
-        public List<Job> GetTopJobs(int n)
+        public IEnumerable<Job> GetTopJobs(int n)
         {
             lock (_lockObj)
             {
@@ -219,6 +233,7 @@ namespace IndustrialProcessing
 
             var reportData = snapshot
                 .GroupBy(s => s.Type)
+                .OrderBy(g => g.Key)    //Sortiranje po tipu posla
                 .Select(g => new
                 {
                     Type = g.Key,
@@ -236,11 +251,15 @@ namespace IndustrialProcessing
                 ))
             );
 
-            string fileName = $"Report_{_reportIndex}.xml";
+            string folderPath = "Reports";
+            if (!System.IO.Directory.Exists(folderPath))
+            {
+                System.IO.Directory.CreateDirectory(folderPath);
+            }
+            string fileName = System.IO.Path.Combine(folderPath, $"Report_{_reportIndex}.xml");
             root.Save(fileName);
 
             _reportIndex = (_reportIndex + 1) % 10;
-
         }
     }
 }
